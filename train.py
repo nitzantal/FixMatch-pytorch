@@ -6,6 +6,7 @@ import random
 import shutil
 import time
 from collections import OrderedDict
+from dataset.pe import get_data
 
 import numpy as np
 import torch
@@ -14,11 +15,12 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
+#from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset.cifar import DATASET_GETTERS
 from utils import AverageMeter, accuracy
+from sklearn.metrics import roc_auc_score
 
 logger = logging.getLogger(__name__)
 best_acc = 0
@@ -66,6 +68,7 @@ def de_interleave(x, size):
 
 
 def main():
+    
     parser = argparse.ArgumentParser(description='PyTorch FixMatch Training')
     parser.add_argument('--gpu-id', default='0', type=int,
                         help='id(s) for CUDA_VISIBLE_DEVICES')
@@ -83,8 +86,8 @@ def main():
                         help='dataset name')
     parser.add_argument('--total-steps', default=2**20, type=int,
                         help='number of total steps to run')
-    parser.add_argument('--eval-step', default=1024, type=int,
-                        help='number of eval steps to run')
+    parser.add_argument('--eval-step', default=256, type=int,
+                        help='number of eval steps to run') #1024
     parser.add_argument('--start-epoch', default=0, type=int,
                         help='manual epoch number (useful on restarts)')
     parser.add_argument('--batch-size', default=64, type=int,
@@ -126,6 +129,7 @@ def main():
                         help="don't use progress bar")
 
     args = parser.parse_args()
+    #get_data(args)
     global best_acc
 
     def create_model(args):
@@ -152,6 +156,10 @@ def main():
     else:
         torch.cuda.set_device(args.local_rank)
         device = torch.device('cuda', args.local_rank)
+
+        #import os
+        os.environ['MASTER_PORT'] = '2000901'
+
         torch.distributed.init_process_group(backend='nccl')
         args.world_size = torch.distributed.get_world_size()
         args.n_gpu = 1
@@ -177,10 +185,10 @@ def main():
 
     if args.local_rank in [-1, 0]:
         os.makedirs(args.out, exist_ok=True)
-        args.writer = SummaryWriter(args.out)
+       # args.writer = SummaryWriter(args.out)
 
     if args.dataset == 'cifar10':
-        args.num_classes = 10
+        args.num_classes = 2#10
         if args.arch == 'wideresnet':
             args.model_depth = 28
             args.model_width = 2
@@ -202,8 +210,7 @@ def main():
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
 
-    labeled_dataset, unlabeled_dataset, test_dataset = DATASET_GETTERS[args.dataset](
-        args, './data')
+    labeled_dataset, unlabeled_dataset, test_dataset = get_data(args)#DATASET_GETTERS[args.dataset]( args, './data')
 
     if args.local_rank == 0:
         torch.distributed.barrier()
@@ -230,6 +237,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers)
 
+    print("dataloaders",len(labeled_trainloader), len(unlabeled_trainloader), len(test_loader))
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
 
@@ -241,19 +249,21 @@ def main():
     model.to(args.device)
 
     no_decay = ['bias', 'bn']
+    print("1111")
     grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(
             nd in n for nd in no_decay)], 'weight_decay': args.wdecay},
         {'params': [p for n, p in model.named_parameters() if any(
             nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
+    print('2222')
     optimizer = optim.SGD(grouped_parameters, lr=args.lr,
                           momentum=0.9, nesterov=args.nesterov)
 
     args.epochs = math.ceil(args.total_steps / args.eval_step)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, args.warmup, args.total_steps)
-
+    print('333')
     if args.use_ema:
         from models.ema import ModelEMA
         ema_model = ModelEMA(args, model, args.ema_decay)
@@ -321,13 +331,14 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
     unlabeled_iter = iter(unlabeled_trainloader)
 
     model.train()
-    for epoch in range(args.start_epoch, args.epochs):
+    for epoch in range(args.start_epoch,3):#args.epochs):
         if not args.no_progress:
             p_bar = tqdm(range(args.eval_step),
                          disable=args.local_rank not in [-1, 0])
         for batch_idx in range(args.eval_step):
             try:
                 inputs_x, targets_x = labeled_iter.next()
+                #print('eee',targets_x[:10])
             except:
                 if args.world_size > 1:
                     labeled_epoch += 1
@@ -343,11 +354,13 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                     unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
                 unlabeled_iter = iter(unlabeled_trainloader)
                 (inputs_u_w, inputs_u_s), _ = unlabeled_iter.next()
-
+            
             data_time.update(time.time() - end)
+            #print('2')
             batch_size = inputs_x.shape[0]
             inputs = interleave(
                 torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2*args.mu+1).to(args.device)
+            #print('3')
             targets_x = targets_x.to(args.device)
             logits = model(inputs)
             logits = de_interleave(logits, 2*args.mu+1)
@@ -408,15 +421,17 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             test_model = model
 
         if args.local_rank in [-1, 0]:
-            test_loss, test_acc = test(args, test_loader, test_model, epoch)
+            test_loss, test_acc, y_pred, y_true = test(args, test_loader, test_model, epoch)
 
-            args.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
-            args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
-            args.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
-            args.writer.add_scalar('train/4.mask', mask_probs.avg, epoch)
-            args.writer.add_scalar('test/1.test_acc', test_acc, epoch)
-            args.writer.add_scalar('test/2.test_loss', test_loss, epoch)
-
+            # args.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
+            # args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
+            # args.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
+            # args.writer.add_scalar('train/4.mask', mask_probs.avg, epoch)
+            # args.writer.add_scalar('test/1.test_acc', test_acc, epoch)
+            # args.writer.add_scalar('test/2.test_loss', test_loss, epoch)
+            y_pred=np.concatenate(y_pred)
+            y_true=np.concatenate(y_true)
+            print('auc:', roc_auc_score(y_true,y_pred))
             is_best = test_acc > best_acc
             best_acc = max(test_acc, best_acc)
 
@@ -424,6 +439,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             if args.use_ema:
                 ema_to_save = ema_model.ema.module if hasattr(
                     ema_model.ema, "module") else ema_model.ema
+            print('1212121')
             save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model_to_save.state_dict(),
@@ -433,7 +449,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
             }, is_best, args.out)
-
+            print('133333')
             test_accs.append(test_acc)
             logger.info('Best top-1 acc: {:.2f}'.format(best_acc))
             logger.info('Mean top-1 acc: {:.2f}\n'.format(
@@ -451,6 +467,10 @@ def test(args, test_loader, model, epoch):
     top5 = AverageMeter()
     end = time.time()
 
+    print('test')
+    detected =0
+    y_pred=[]
+    y_true=[]
     if not args.no_progress:
         test_loader = tqdm(test_loader,
                            disable=args.local_rank not in [-1, 0])
@@ -463,12 +483,16 @@ def test(args, test_loader, model, epoch):
             inputs = inputs.to(args.device)
             targets = targets.to(args.device)
             outputs = model(inputs)
+            
             loss = F.cross_entropy(outputs, targets)
-
-            prec1, prec5 = accuracy(outputs, targets, topk=(1, 5))
+            probs=F.softmax(outputs, dim=1).cpu().detach().numpy()
+            y_pred.append(np.max(probs, axis=1))
+            detected+=((outputs==1).sum())
+            y_true.append(targets.cpu().detach().numpy())
+            [prec1]= accuracy(outputs, targets)#, topk=(1, 5)) prec5 
             losses.update(loss.item(), inputs.shape[0])
             top1.update(prec1.item(), inputs.shape[0])
-            top5.update(prec5.item(), inputs.shape[0])
+            top5.update(prec1.item(), inputs.shape[0]) ####prec5 
             batch_time.update(time.time() - end)
             end = time.time()
             if not args.no_progress:
@@ -485,8 +509,8 @@ def test(args, test_loader, model, epoch):
             test_loader.close()
 
     logger.info("top-1 acc: {:.2f}".format(top1.avg))
-    logger.info("top-5 acc: {:.2f}".format(top5.avg))
-    return losses.avg, top1.avg
+    #logger.info("top-5 acc: {:.2f}".format(top5.avg))
+    return losses.avg, top1.avg, y_pred, y_true
 
 
 if __name__ == '__main__':
